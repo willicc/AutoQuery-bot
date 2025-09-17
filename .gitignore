@@ -21,3 +21,7 @@ npm-debug.log*
 # OS files
 .DS_Store
 Thumbs.db
+
+# File-file sementara
+tmp/
+*.tmp
