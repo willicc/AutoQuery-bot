@@ -1,0 +1,1 @@
+@animix_game_bot|https://pro-api.animix.tech
