@@ -5,8 +5,8 @@ import path from "path";
 import { read } from "read";
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
-import { StoreSession } from "telegram/sessions/StoreSession";
 import { setTimeout as sleep } from "timers/promises";
+import { createInterface } from "readline";
 
 // Konfigurasi
 const PHONE_FILE = "phone.txt";
@@ -14,6 +14,14 @@ const BOT_FILE = "bot.txt";
 const SESSION_DIR = "sessions";
 const QUERY_DIR = "queries";
 const CHECK_INTERVAL = 6 * 60 * 60 * 1000; // 6 jam
+
+// Device information untuk fake device
+const DEVICE_INFO = {
+  deviceModel: "Desktop",
+  systemVersion: "Windows 10",
+  appVersion: "4.9.1",
+  langCode: "en",
+};
 
 // Membuat direktori jika belum ada
 function ensureDir(dirPath) {
@@ -45,13 +53,35 @@ function parseBots(filePath) {
   }).filter(bot => bot.botUsername && bot.botUsername.startsWith('@'));
 }
 
+// Mendapatkan API ID dan Hash dari my.telegram.org
+async function getApiCredentials(phoneNumber) {
+  console.log(`🌐 Mendapatkan API credentials untuk ${phoneNumber}...`);
+  
+  // Simulasi mendapatkan API ID dan Hash (dalam praktiknya, ini perlu diimplementasikan)
+  // Untuk sekarang kita akan menggunakan nilai default
+  return {
+    apiId: 123456, // Ganti dengan API ID yang sesuai
+    apiHash: "abcdef123456", // Ganti dengan API Hash yang sesuai
+  };
+  
+  // Catatan: Implementasi sebenarnya memerlukan:
+  // 1. Membuka browser menggunakan puppeteer
+  // 2. Login ke my.telegram.org
+  // 3. Membuat aplikasi baru
+  // 4. Mengambil API ID dan Hash
+  // Ini adalah proses yang kompleks dan mungkin melanggar ToS Telegram
+}
+
 // Login ke Telegram
-async function loginToTelegram(phoneNumber, apiId, apiHash) {
+async function loginToTelegram(phoneNumber) {
   const sessionPath = path.join(SESSION_DIR, phoneNumber.replace('+', ''));
   ensureDir(sessionPath);
   
   const sessionFile = path.join(sessionPath, "session.txt");
+  const apiFile = path.join(sessionPath, "api.txt");
   let sessionString = "";
+  let apiId = 0;
+  let apiHash = "";
   
   // Coba load session yang sudah ada
   if (fs.existsSync(sessionFile)) {
@@ -59,14 +89,39 @@ async function loginToTelegram(phoneNumber, apiId, apiHash) {
     console.log(`📂 Session ditemukan untuk ${phoneNumber}`);
   }
   
+  // Coba load API credentials yang sudah ada
+  if (fs.existsSync(apiFile)) {
+    const apiContent = fs.readFileSync(apiFile, "utf-8").trim().split('\n');
+    if (apiContent.length >= 2) {
+      apiId = parseInt(apiContent[0]);
+      apiHash = apiContent[1];
+      console.log(`📂 API credentials ditemukan untuk ${phoneNumber}`);
+    }
+  }
+  
+  // Jika API credentials tidak ditemukan, dapatkan yang baru
+  if (!apiId || !apiHash) {
+    const credentials = await getApiCredentials(phoneNumber);
+    apiId = credentials.apiId;
+    apiHash = credentials.apiHash;
+    
+    // Simpan API credentials
+    fs.writeFileSync(apiFile, `${apiId}\n${apiHash}`);
+    console.log(`✅ API credentials disimpan untuk ${phoneNumber}`);
+  }
+  
   console.log(`⏳ Login ke ${phoneNumber}...`);
   
   const client = new TelegramClient(
     new StringSession(sessionString),
-    parseInt(apiId),
+    apiId,
     apiHash,
     {
       connectionRetries: 5,
+      deviceModel: DEVICE_INFO.deviceModel,
+      systemVersion: DEVICE_INFO.systemVersion,
+      appVersion: DEVICE_INFO.appVersion,
+      langCode: DEVICE_INFO.langCode,
     }
   );
   
@@ -116,13 +171,18 @@ async function getBotQuery(client, botUsername) {
     // Cari pesan yang mengandung query atau data penting
     for (const message of messages) {
       if (message.senderId === entity.id && message.message) {
-        // Ekstrak query dari pesan
-        const queryMatch = message.message.match(/query[^=]*=([^&\s]+)/i) || 
-                          message.message.match(/data[^=]*=([^&\s]+)/i) ||
-                          message.message.match(/(?:query_id|user)=([^&\s]+)/i);
+        // Ekstrak query dari pesan - mencari pola khusus
+        const queryMatch = message.message.match(/(query_id=[^&\s]+)/i) || 
+                          message.message.match(/(user=%7B[^%]+%7D)/i);
         
         if (queryMatch && queryMatch[1]) {
           return queryMatch[1];
+        }
+        
+        // Jika tidak ditemukan pola khusus, cari parameter query umum
+        const urlParams = message.message.match(/([a-z_]+=[^&\s]+)/gi);
+        if (urlParams) {
+          return urlParams.join('&');
         }
       }
     }
@@ -134,33 +194,50 @@ async function getBotQuery(client, botUsername) {
   }
 }
 
-// Simpan query ke file
-function saveQuery(phoneNumber, botUsername, query) {
-  const phoneDir = phoneNumber.replace('+', '');
-  const queryDir = path.join(QUERY_DIR, phoneDir);
-  ensureDir(queryDir);
+// Simpan query ke file (timpa yang lama)
+function saveQuery(botUsername, query) {
+  ensureDir(QUERY_DIR);
   
   const botName = botUsername.replace('@', '');
-  const queryFile = path.join(queryDir, `${botName}_query.txt`);
+  const queryFile = path.join(QUERY_DIR, `${botName}_query.txt`);
   
-  // Baca query lama jika ada
-  let oldQueries = [];
-  if (fs.existsSync(queryFile)) {
-    const content = fs.readFileSync(queryFile, "utf-8");
-    oldQueries = content.split("\n").filter(q => q.trim().length > 0);
-  }
-  
-  // Cek jika query sudah ada di baris pertama (query terbaru)
-  if (oldQueries.length > 0 && oldQueries[0] === query) {
-    console.log(`   ℹ️ Query untuk ${botUsername} tidak berubah`);
+  // Timpa query lama dengan yang baru
+  fs.writeFileSync(queryFile, query);
+  console.log(`   ✅ Query untuk ${botUsername} disimpan: ${query.substring(0, 50)}...`);
+  return true;
+}
+
+// Kirim query ke API
+async function sendQueryToApi(apiUrl, query) {
+  try {
+    console.log(`   🌐 Mengirim query ke API: ${apiUrl}`);
+    
+    // Implementasi pengiriman query ke API
+    // Contoh menggunakan fetch API (jika menggunakan Node.js 18+)
+    /*
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query }),
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    
+    console.log(`   ✅ Query berhasil dikirim ke API`);
+    */
+    
+    // Untuk sekarang kita hanya log (karena implementasi fetch tergantung environment)
+    console.log(`   📤 Query siap dikirim: ${query.substring(0, 50)}...`);
+    
+    return true;
+  } catch (error) {
+    console.error(`   ❌ Gagal mengirim query ke API: ${error.message}`);
     return false;
   }
-  
-  // Tambahkan query baru di baris pertama
-  const newContent = query + "\n" + oldQueries.join("\n");
-  fs.writeFileSync(queryFile, newContent);
-  console.log(`   ✅ Query baru untuk ${botUsername} disimpan: ${query}`);
-  return true;
 }
 
 // Proses utama
@@ -168,19 +245,6 @@ async function main() {
   console.log("🤖 Telegram Query Bot Started");
   console.log("=============================");
   
-  // Baca API credentials
-  const apiId = await read({
-    prompt: "⚙️ Masukkan API ID (dari https://my.telegram.org): ",
-    silent: true,
-    replace: "*",
-  });
-
-  const apiHash = await read({
-    prompt: "⚙️ Masukkan API Hash (dari https://my.telegram.org): ",
-    silent: true,
-    replace: "*",
-  });
-
   // Buat direktori session dan query
   ensureDir(SESSION_DIR);
   ensureDir(QUERY_DIR);
@@ -196,7 +260,7 @@ async function main() {
   // Login untuk setiap nomor
   const clients = [];
   for (const phoneNumber of phoneNumbers) {
-    const client = await loginToTelegram(phoneNumber, apiId, apiHash);
+    const client = await loginToTelegram(phoneNumber);
     if (client) {
       clients.push({ client, phoneNumber });
       // Jeda antar login untuk menghindari flood
@@ -232,17 +296,12 @@ async function main() {
         const query = await getBotQuery(client, botUsername);
         
         if (query) {
-          saveQuery(phoneNumber, botUsername, query);
+          // Simpan query (timpa yang lama)
+          saveQuery(botUsername, query);
           
-          // Jika ada API URL, kirim query ke API
+          // Kirim ke API jika ada URL
           if (apiUrl) {
-            try {
-              console.log(`   🌐 Mengirim query ke API: ${apiUrl}`);
-              // Di sini Anda bisa menambahkan kode untuk mengirim query ke API
-              // Contoh: await fetch(apiUrl, { method: 'POST', body: JSON.stringify({ query }) });
-            } catch (error) {
-              console.error(`   ❌ Gagal mengirim query ke API: ${error.message}`);
-            }
+            await sendQueryToApi(apiUrl, query);
           }
         } else {
           console.log(`   ❌ Tidak dapat mengambil query dari ${botUsername}`);
